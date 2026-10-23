@@ -1,18 +1,55 @@
+import csv
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from pyspark.sql import SparkSession
 
 from src.data_pipeline import run_data_engineering, run_ibm_data_engineering
 from src.feature_engineering import process_ml_features
-from src.model_pipeline import train_and_evaluate_models
+from src.model_pipeline import (
+    _classification_metrics,
+    train_and_evaluate_models,
+)
 from src.sql_analytics import run_sql_analytics
 from src.visualization import create_pipeline_visualizations
-from run_pipeline import _resolve_ibm_transactions
+from run_pipeline import _resolve_transaction_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_sample_transactions(path: Path) -> None:
+    with path.open("w", encoding="utf-8", newline="") as transaction_file:
+        writer = csv.writer(transaction_file)
+        writer.writerow(
+            [
+                "transaction_id",
+                "timestamp",
+                "sender_account",
+                "receiver_account",
+                "amount",
+                "payment_type",
+                "is_laundering",
+            ]
+        )
+        start = datetime(2025, 1, 1)
+        for index in range(48):
+            sender_number = index % 8 + 1
+            sender = f"U{sender_number:03d}"
+            receiver = f"U{(sender_number % 8) + 1:03d}"
+            writer.writerow(
+                [
+                    f"T{index + 1:04d}",
+                    (start + timedelta(hours=index)).isoformat(),
+                    sender,
+                    receiver,
+                    9500 if sender == "U002" else 100 + index,
+                    "WIRE_TRANSFER" if index % 3 == 0 else "ACH",
+                    int(sender in {"U002", "U004", "U007"}),
+                ]
+            )
 
 
 class SparkPipelineTests(unittest.TestCase):
@@ -27,10 +64,15 @@ class SparkPipelineTests(unittest.TestCase):
             .getOrCreate()
         )
         cls.spark.sparkContext.setLogLevel("ERROR")
+        cls._test_data_directory = tempfile.TemporaryDirectory()
+        cls._transactions_path = (
+            Path(cls._test_data_directory.name) / "transactions.csv"
+        )
+        _write_sample_transactions(cls._transactions_path)
         cls.base_df = run_data_engineering(
             cls.spark,
             str(PROJECT_ROOT / "data" / "mock_users.txt"),
-            str(PROJECT_ROOT / "data" / "aml_transactions.csv"),
+            str(cls._transactions_path),
         ).cache()
         cls.base_df.count()
 
@@ -38,6 +80,7 @@ class SparkPipelineTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.base_df.unpersist()
         cls.spark.stop()
+        cls._test_data_directory.cleanup()
 
     def test_sample_data_and_identity_structuring_signals(self) -> None:
         self.assertEqual(self.base_df.count(), 48)
@@ -85,6 +128,10 @@ class SparkPipelineTests(unittest.TestCase):
                 "payment_currency",
                 "is_laundering",
             ).orderBy("is_laundering").collect()
+            limited = run_ibm_data_engineering(
+                isolated_spark, str(transaction_file), max_rows=1
+            )
+            limited_count = limited.count()
 
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["sender_account"], "1:1001")
@@ -93,73 +140,94 @@ class SparkPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0]["payment_currency"], "US Dollar")
         self.assertEqual(rows[0]["is_laundering"], 0)
         self.assertEqual(rows[1]["is_laundering"], 1)
+        self.assertEqual(limited_count, 1)
 
-    def test_ibm_directory_selects_requested_or_largest_transaction_file(self) -> None:
+    def test_pipeline_resolves_only_the_small_ibm_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data_directory = Path(directory)
             small = data_directory / "HI-Small_Trans.csv"
-            large = data_directory / "HI-Large_Trans.csv"
+            medium = data_directory / "HI-Medium_Trans.csv"
             small.write_text("small\n", encoding="utf-8")
-            large.write_text("large\n" * 10, encoding="utf-8")
+            medium.write_text("medium\n", encoding="utf-8")
 
-            self.assertEqual(
-                _resolve_ibm_transactions(str(data_directory), "large"),
-                str(large.resolve()),
-            )
-            self.assertEqual(
-                _resolve_ibm_transactions(str(data_directory), "largest"),
-                str(large.resolve()),
-            )
+            self.assertEqual(_resolve_transaction_file(str(small)), str(small.resolve()))
+            with self.assertRaisesRegex(ValueError, "HI-Small_Trans.csv"):
+                _resolve_transaction_file(str(medium))
 
-    def test_reusable_sql_queries_and_optional_model_view(self) -> None:
+    def test_reusable_bounded_aml_sql_queries(self) -> None:
         results = run_sql_analytics(self.spark)
         self.assertEqual(results["transaction_totals"].count(), 1)
-        self.assertEqual(results["highest_value_transactions"].count(), 20)
-        self.assertGreater(results["payment_type_wildcard_search"].count(), 0)
-        self.assertGreater(results["shared_contact_information"].count(), 0)
-        self.assertGreater(results["repeated_near_threshold_accounts"].count(), 0)
-        self.assertIn("duplicate_transaction_ids", results)
-        self.assertEqual(results["duplicate_transaction_ids"].count(), 0)
-
-        self.spark.createDataFrame(
-            [("T0001", 0.0, 0.0)], ["transaction_id", "label", "prediction"]
-        ).createOrReplaceTempView("model_predictions")
-        prediction_results = run_sql_analytics(self.spark)
-        self.assertIn("model_label_comparison", prediction_results)
-        self.assertEqual(prediction_results["model_label_comparison"].count(), 1)
+        self.assertLessEqual(results["highest_risk_transactions"].count(), 20)
+        self.assertGreater(results["payment_type_summary"].count(), 0)
+        self.assertGreater(results["near_threshold_summary"].count(), 0)
+        self.assertGreater(results["sender_receiver_patterns"].count(), 0)
+        self.assertEqual(
+            set(results),
+            {
+                "transaction_totals",
+                "suspicious_transactions_by_risk",
+                "highest_risk_transactions",
+                "payment_type_summary",
+                "near_threshold_summary",
+                "sender_receiver_patterns",
+            },
+        )
 
     def test_feature_pipeline_models_and_visualizations(self) -> None:
         with tempfile.TemporaryDirectory() as output_directory:
             ml_df = process_ml_features(
-                self.spark, self.base_df, output_dir=output_directory
+                self.base_df, output_dir=output_directory
             )
             self.assertTrue((Path(output_directory) / "correlation_heatmap.png").is_file())
-            results = train_and_evaluate_models(ml_df)
+            results = train_and_evaluate_models(
+                ml_df,
+                output_dir=output_directory,
+            )
             create_pipeline_visualizations(self.base_df, results, output_directory)
 
             for artifact in (
                 "transaction_overview.png",
                 "model_comparison.png",
                 "confusion_matrices.png",
-                "roc_precision_recall.png",
+                "feature_importance.png",
                 "transaction_flow_map.png",
                 "model_metrics.csv",
             ):
                 self.assertTrue((Path(output_directory) / artifact).is_file())
+            self.assertTrue(
+                (Path(output_directory) / "metrics" / "model_metrics.csv").is_file()
+            )
+            self.assertTrue(
+                (
+                    Path(output_directory)
+                    / "metrics"
+                    / "evaluation_summary.json"
+                ).is_file()
+            )
         expected_models = {
             "Decision Tree",
             "Random Forest",
-            "K-means",
+            "Gradient-Boosted Trees",
         }
         self.assertTrue(expected_models.issubset(results["models"]))
+        self.assertEqual(
+            set(results["models"]),
+            {"Decision Tree", "Random Forest", "Gradient-Boosted Trees"},
+        )
         comparison = results["comparison"]
         self.assertIsNotNone(comparison)
         assert comparison is not None
-        self.assertEqual(comparison.filter("task = 'binary classification'").count(), 2)
+        self.assertEqual(comparison.filter("task = 'binary classification'").count(), 3)
         self.assertTrue(
-            {"area_under_pr", "area_under_roc", "positive_rate"}.issubset(
-                comparison.columns
-            )
+            {
+                "area_under_pr",
+                "area_under_roc",
+                "positive_rate",
+                "threshold",
+                "default_precision",
+                "false_positives",
+                "false_negatives",
+            }.issubset(comparison.columns)
         )
         self.assertEqual(
             results["predictions"]["Random Forest"]
@@ -168,6 +236,24 @@ class SparkPipelineTests(unittest.TestCase):
             .count(),
             2,
         )
+        self.assertEqual(
+            set(results["models"]),
+            {"Decision Tree", "Random Forest", "Gradient-Boosted Trees"},
+        )
+        for predictions in results["predictions"].values():
+            predictions.unpersist()
+
+    def test_classification_metrics_use_laundering_as_positive_label(self) -> None:
+        predictions = self.spark.createDataFrame(
+            [(1.0, 1.0), (1.0, 0.0), (0.0, 1.0)],
+            ["label", "prediction"],
+        )
+        metrics = _classification_metrics(predictions)
+        self.assertEqual(metrics["precision"], 0.5)
+        self.assertEqual(metrics["recall"], 0.5)
+        self.assertEqual(metrics["false_positives"], 1)
+        self.assertEqual(metrics["false_negatives"], 1)
+        self.assertAlmostEqual(metrics["positive_rate"], 2 / 3)
 
     def test_y_invalid_and_duplicate_transaction_rows_are_reported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -191,20 +277,40 @@ class SparkPipelineTests(unittest.TestCase):
                 self.spark, str(customer_file), str(transaction_file)
             )
             self.assertEqual(cleaned.count(), 1)
+            raw_transactions = self.spark.table("transactions_raw")
+            duplicate_ids = (
+                raw_transactions.groupBy("transaction_id")
+                .count()
+                .filter("count > 1")
+                .count()
+            )
+            self.assertEqual(duplicate_ids, 1)
             self.assertEqual(
-                run_sql_analytics(self.spark)["duplicate_transaction_ids"].count(),
+                raw_transactions.filter("amount IS NULL").count(),
                 1,
             )
-            missing = run_sql_analytics(self.spark)["missing_data_summary"].first()
-            self.assertEqual(missing["missing_amounts"], 1)
-            self.assertEqual(missing["missing_timestamps"], 0)
+
+    def test_model_training_fails_when_a_time_split_lacks_both_labels(self) -> None:
+        data = self.spark.createDataFrame(
+            [
+                (datetime(2025, 1, 1), 0.0),
+                (datetime(2025, 1, 2), 0.0),
+                (datetime(2025, 1, 3), 0.0),
+                (datetime(2025, 1, 4), 0.0),
+                (datetime(2025, 1, 5), 0.0),
+            ],
+            ["timestamp", "label"],
+        )
+        with tempfile.TemporaryDirectory() as output_directory:
+            with self.assertRaisesRegex(ValueError, "both labels"):
+                train_and_evaluate_models(data, output_dir=output_directory)
 
     def test_z_missing_and_empty_inputs_fail_explicitly(self) -> None:
         with self.assertRaises(FileNotFoundError):
             run_data_engineering(
                 self.spark,
                 "missing-customer-file.txt",
-                str(PROJECT_ROOT / "data" / "aml_transactions.csv"),
+                str(self._transactions_path),
             )
 
         with tempfile.TemporaryDirectory() as directory:

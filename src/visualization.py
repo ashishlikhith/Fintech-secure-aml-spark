@@ -9,7 +9,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
-from pyspark.ml.functions import vector_to_array
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
@@ -113,8 +112,8 @@ def _plot_model_metrics(
     metrics = comparison.toPandas()
     metrics.to_csv(output_dir / "model_metrics.csv", index=False)
 
-    figure, axes = plt.subplots(1, 2, figsize=(12, 5))
-    metric_columns = ["precision", "recall", "f1", "area_under_pr", "area_under_roc"]
+    figure, axis = plt.subplots(figsize=(10, 5))
+    metric_columns = ["precision", "recall", "f1", "area_under_pr"]
     melted = metrics.melt(
         id_vars="model", value_vars=metric_columns, var_name="metric", value_name="score"
     )
@@ -123,63 +122,29 @@ def _plot_model_metrics(
         x="metric",
         y="score",
         hue="model",
-        ax=axes[0],
+        ax=axis,
         palette="Set2",
     )
-    axes[0].set(
-        title="Future-period model comparison",
+    axis.set(
+        title="Future-period model comparison (positive-class metrics)",
         xlabel="Metric",
         ylabel="Score",
         ylim=(0, 1),
     )
-    axes[0].tick_params(axis="x", rotation=25)
-
-    cluster_predictions = model_results["predictions"].get("K-means")
-    if cluster_predictions is not None:
-        cluster_summary = (
-            cluster_predictions.groupBy("cluster")
-            .agg(
-                F.count("*").alias("transactions"),
-                F.avg("label").alias("observed_flag_rate"),
-            )
-            .orderBy("cluster")
-            .toPandas()
-        )
-        sns.barplot(
-            data=cluster_summary,
-            x="cluster",
-            y="transactions",
-            hue="cluster",
-            legend=False,
-            ax=axes[1],
-            palette="crest",
-        )
-        axes[1].set(
-            title="K-means test cluster sizes (unsupervised)",
-            xlabel="Cluster",
-            ylabel="Transactions",
-        )
-        for index, row in cluster_summary.iterrows():
-            if pd.notna(row["observed_flag_rate"]):
-                axes[1].text(
-                    index,
-                    row["transactions"],
-                    f"flag share {row['observed_flag_rate']:.1%}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                )
-    else:
-        axes[1].set_visible(False)
+    axis.tick_params(axis="x", rotation=20)
     _save_figure(figure, output_dir / "model_comparison.png")
 
 
-def _plot_confusion_and_curves(
+def _plot_confusion_matrices(
     model_results: Mapping[str, object], output_dir: Path
 ) -> None:
     classification_models = [
         name
-        for name in ("Decision Tree", "Random Forest")
+        for name in (
+            "Decision Tree",
+            "Random Forest",
+            "Gradient-Boosted Trees",
+        )
         if name in model_results["predictions"]
     ]
     if not classification_models:
@@ -215,53 +180,35 @@ def _plot_confusion_and_curves(
         )
     _save_figure(figure, output_dir / "confusion_matrices.png")
 
-    figure, axes = plt.subplots(1, 2, figsize=(13, 5))
-    for name in classification_models:
-        predictions = model_results["predictions"][name]
-        score = vector_to_array("probability")[1]
-        buckets = (
-            predictions.select(
-                "label",
-                F.least(F.floor(score * 100), F.lit(99)).cast("int").alias("bucket"),
-            )
-            .groupBy("bucket")
-            .agg(
-                F.sum("label").alias("positive"),
-                F.count("*").alias("total"),
-            )
-            .withColumn("negative", F.col("total") - F.col("positive"))
-            .orderBy(F.desc("bucket"))
-            .toPandas()
-        )
-        if buckets.empty:
-            continue
-        true_positive_rate = buckets["positive"].cumsum() / max(
-            buckets["positive"].sum(), 1
-        )
-        false_positive_rate = buckets["negative"].cumsum() / max(
-            buckets["negative"].sum(), 1
-        )
-        precision = buckets["positive"].cumsum() / buckets["total"].cumsum().clip(lower=1)
-        axes[0].plot(false_positive_rate, true_positive_rate, label=name)
-        axes[1].plot(true_positive_rate, precision, label=name)
-    axes[0].plot([0, 1], [0, 1], linestyle=":", color="gray", label="Random baseline")
-    axes[0].set(
-        title="ROC curve (100 score bins)",
-        xlabel="False-positive rate",
-        ylabel="True-positive rate",
-        xlim=(0, 1),
-        ylim=(0, 1),
+
+def _plot_feature_importance(
+    model_results: Mapping[str, object], output_dir: Path
+) -> None:
+    model_names = [
+        name
+        for name in ("Decision Tree", "Random Forest", "Gradient-Boosted Trees")
+        if name in model_results["models"]
+    ]
+    feature_names = model_results["feature_names"]
+    figure, axes = plt.subplots(
+        1, len(model_names), figsize=(6 * len(model_names), 7), squeeze=False
     )
-    axes[1].set(
-        title="Precision-recall curve (100 score bins)",
-        xlabel="Recall",
-        ylabel="Precision",
-        xlim=(0, 1),
-        ylim=(0, 1),
-    )
-    for axis in axes:
-        axis.legend()
-    _save_figure(figure, output_dir / "roc_precision_recall.png")
+    for axis, name in zip(axes[0], model_names):
+        model = model_results["models"][name]
+        importances = model.featureImportances.toArray()
+        if len(importances) != len(feature_names):
+            raise ValueError(
+                f"{name} importance count does not match the assembled features."
+            )
+        ranked = sorted(
+            zip(feature_names, importances), key=lambda item: item[1], reverse=True
+        )[:12]
+        labels = [item[0] for item in reversed(ranked)]
+        values = [float(item[1]) for item in reversed(ranked)]
+        axis.barh(labels, values, color="#3478a8")
+        axis.set(title=name, xlabel="Feature importance", ylabel="")
+    figure.suptitle("Top model feature importances")
+    _save_figure(figure, output_dir / "feature_importance.png")
 
 
 def _plot_transaction_flow_map(base_df: DataFrame, output_dir: Path) -> None:
@@ -329,5 +276,6 @@ def create_pipeline_visualizations(
     output_path.mkdir(parents=True, exist_ok=True)
     _plot_transaction_overview(base_df, output_path)
     _plot_model_metrics(model_results, output_path)
-    _plot_confusion_and_curves(model_results, output_path)
+    _plot_confusion_matrices(model_results, output_path)
+    _plot_feature_importance(model_results, output_path)
     _plot_transaction_flow_map(base_df, output_path)

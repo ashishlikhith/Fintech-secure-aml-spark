@@ -1,0 +1,80 @@
+{
+  "positive_label": 1,
+  "threshold_selection": "maximum validation F1 over probability bins of width 0.001",
+  "split_class_counts": {
+    "train": {
+      "0.0": 599708,
+      "1.0": 16
+    },
+    "validation": {
+      "0.0": 200143,
+      "1.0": 7
+    },
+    "test": {
+      "0.0": 200091,
+      "1.0": 35
+    }
+  },
+  "models": [
+    {
+      "model": "Decision Tree",
+      "task": "binary classification",
+      "accuracy": 0.9836353097548545,
+      "precision": 0.002457002457002457,
+      "recall": 0.22857142857142856,
+      "f1": 0.004861744150714069,
+      "false_positives": 3248,
+      "false_negatives": 27,
+      "positive_rate": 0.00017488981941376933,
+      "default_precision": 0.003548835056318469,
+      "default_recall": 0.6571428571428571,
+      "default_f1": 0.007059545733578882,
+      "default_false_positives": 6458,
+      "default_false_negatives": 12,
+      "threshold": 0.978,
+      "area_under_pr": 0.002486918578866287,
+      "area_under_roc": 0.8107888053792666,
+      "training_seconds": 14.008577200000218
+    },
+    {
+      "model": "Random Forest",
+      "task": "binary classification",
+      "accuracy": 0.9977014480877048,
+      "precision": 0.0069605568445475635,
+      "recall": 0.08571428571428572,
+      "f1": 0.012875536480686695,
+      "false_positives": 428,
+      "false_negatives": 32,
+      "positive_rate": 0.00017488981941376933,
+      "default_precision": 0.004144600506562284,
+      "default_recall": 0.5142857142857142,
+      "default_f1": 0.008222932846048423,
+      "default_false_positives": 4325,
+      "default_false_negatives": 17,
+      "threshold": 0.867,
+      "area_under_pr": 0.003260212497803946,
+      "area_under_roc": 0.9684956202070913,
+      "training_seconds": 14.53039230000013
+    },
+    {
+      "model": "Gradient-Boosted Trees",
+      "task": "binary classification",
+      "accuracy": 0.9836353097548545,
+      "precision": 0.002457002457002457,
+      "recall": 0.22857142857142856,
+      "f1": 0.004861744150714069,
+      "false_positives": 3248,
+      "false_negatives": 27,
+      "positive_rate": 0.00017488981941376933,
+      "default_precision": 0.0021057557323350493,
+      "default_recall": 0.5142857142857142,
+      "default_f1": 0.004194337644180357,
+      "default_false_positives": 8530,
+      "default_false_negatives": 17,
+      "threshold": 0.89,
+      "area_under_pr": 0.0023113982108577853,
+      "area_under_roc": 0.9668810691135533,
+      "training_seconds": 11.609997600000497
+    }
+  ]
+}

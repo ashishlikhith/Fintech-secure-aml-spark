@@ -49,7 +49,9 @@ def _require_file(path: str, description: str) -> None:
         raise FileNotFoundError(f"{description} file does not exist: {path}")
 
 
-def _clean_transactions(raw_transactions: DataFrame) -> DataFrame:
+def _clean_transactions(
+    raw_transactions: DataFrame, content_addressed_ids: bool = False
+) -> DataFrame:
     if "payment_currency" not in raw_transactions.columns:
         raw_transactions = raw_transactions.withColumn(
             "payment_currency", F.lit("UNKNOWN")
@@ -80,27 +82,34 @@ def _clean_transactions(raw_transactions: DataFrame) -> DataFrame:
             | F.col("is_laundering").isin(0, 1)
         )
     )
-    invalid_transaction_count = transactions.filter(
-        ~F.coalesce(valid_transaction, F.lit(False))
-    ).count()
+    quality = transactions.agg(
+        F.count("*").alias("input_rows"),
+        F.sum(F.when(valid_transaction, 1).otherwise(0)).alias("valid_rows"),
+    ).first()
+    invalid_transaction_count = int(quality["input_rows"] - (quality["valid_rows"] or 0))
     if invalid_transaction_count:
         print(f"Skipped {invalid_transaction_count} invalid transaction row(s).")
-    transactions = transactions.filter(valid_transaction).dropDuplicates()
-
-    transaction_id_counts = transactions.groupBy("transaction_id").count()
-    conflicting_transaction_ids = transaction_id_counts.filter(
-        F.col("count") > 1
-    ).select("transaction_id")
-    conflicting_count = conflicting_transaction_ids.count()
-    if conflicting_count:
-        print(
-            f"Excluded {conflicting_count} transaction id(s) with conflicting rows."
-        )
-        transactions = transactions.join(
-            conflicting_transaction_ids, "transaction_id", "left_anti"
-        )
-    if not transactions.limit(1).count():
+    if not quality["valid_rows"]:
         raise ValueError("Transaction input contains no valid transaction records.")
+    transactions = transactions.filter(valid_transaction)
+    if content_addressed_ids:
+        transactions = transactions.dropDuplicates(["transaction_id"])
+    else:
+        transactions = transactions.dropDuplicates()
+        transaction_id_counts = transactions.groupBy("transaction_id").count()
+        conflicting_transaction_ids = transaction_id_counts.filter(
+            F.col("count") > 1
+        ).select("transaction_id")
+        conflicting_count = conflicting_transaction_ids.count()
+        if conflicting_count:
+            print(
+                f"Excluded {conflicting_count} transaction id(s) with conflicting rows."
+            )
+            transactions = transactions.join(
+                conflicting_transaction_ids, "transaction_id", "left_anti"
+            )
+        if not transactions.limit(1).count():
+            raise ValueError("Transaction input contains no valid transaction records.")
     return transactions
 
 
@@ -151,6 +160,7 @@ def run_ibm_data_engineering(
     lookback_seconds: int = 86400,
     repeated_near_threshold_count: int = 2,
     high_velocity_count: int = 5,
+    max_rows: int | None = None,
 ) -> DataFrame:
     """Load IBM AMLSim transactions and enrich them without synthetic profiles."""
     if near_threshold <= 0:
@@ -159,6 +169,8 @@ def run_ibm_data_engineering(
         raise ValueError("near_threshold_ratio must be between zero and one")
     if lookback_seconds <= 0:
         raise ValueError("lookback_seconds must be greater than zero")
+    if max_rows is not None and max_rows <= 0:
+        raise ValueError("max_rows must be greater than zero")
     _require_file(tx_file_path, "IBM transaction")
     started = perf_counter()
     indexes = _ibm_column_indexes(tx_file_path)
@@ -169,8 +181,7 @@ def run_ibm_data_engineering(
         [StructField(column, StringType(), True) for column in source_columns]
     )
     source = (
-        spark.read.option("header", "true")
-        .option("enforceSchema", "true")
+        spark.read.option("header", "false")
         .option("mode", "PERMISSIVE")
         .schema(source_schema)
         .csv(tx_file_path)
@@ -178,6 +189,15 @@ def run_ibm_data_engineering(
 
     def source_column(name: str) -> Column:
         return F.trim(F.col(source_columns[indexes[name]]))
+
+    source = source.filter(
+        F.lower(
+            F.regexp_replace(source_column("timestamp"), "^\ufeff", "")
+        )
+        != "timestamp"
+    )
+    if max_rows is not None:
+        source = source.limit(max_rows)
 
     parsed_timestamp = F.coalesce(
         F.to_timestamp(source_column("timestamp"), "yyyy/MM/dd HH:mm:ss"),
@@ -218,10 +238,11 @@ def run_ibm_data_engineering(
         source_column("payment_format").alias("payment_type"),
         source_column("is_laundering").alias("is_laundering"),
     )
-    transactions = _clean_transactions(raw_transactions)
+    transactions = _clean_transactions(
+        raw_transactions, content_addressed_ids=True
+    )
     customers = spark.createDataFrame([], schema=CUSTOMER_SCHEMA)
     return _enrich_transactions(
-        spark,
         customers,
         transactions,
         near_threshold,
@@ -305,7 +326,6 @@ def run_data_engineering(
     transactions = _clean_transactions(raw_transactions)
 
     return _enrich_transactions(
-        spark,
         customers,
         transactions,
         near_threshold,
@@ -318,7 +338,6 @@ def run_data_engineering(
 
 
 def _enrich_transactions(
-    spark: SparkSession,
     customers: DataFrame,
     transactions: DataFrame,
     near_threshold: float,
@@ -379,20 +398,20 @@ def _enrich_transactions(
     )
 
     account_window = Window.partitionBy("sender_account").orderBy("event_epoch")
-    rolling_window = account_window.rangeBetween(-lookback_seconds, 0)
-    prior_window = (
-        Window.partitionBy("sender_account")
-        .orderBy("event_epoch", "transaction_id")
-        .rowsBetween(Window.unboundedPreceding, -1)
-    )
+    rolling_window = account_window.rangeBetween(-lookback_seconds, -1)
+    prior_window = account_window.rangeBetween(Window.unboundedPreceding, -1)
     enriched = (
         joined.withColumn(
-            "velocity_24h", F.count("transaction_id").over(rolling_window)
+            "velocity_24h",
+            F.coalesce(F.count("transaction_id").over(rolling_window), F.lit(0)),
         )
-        .withColumn("volume_24h", F.sum("amount").over(rolling_window))
+        .withColumn(
+            "volume_24h",
+            F.coalesce(F.sum("amount").over(rolling_window), F.lit(0.0)),
+        )
         .withColumn(
             "near_threshold_count_24h",
-            F.sum("is_near_threshold").over(rolling_window),
+            F.coalesce(F.sum("is_near_threshold").over(rolling_window), F.lit(0)),
         )
         .withColumn(
             "prior_transaction_count",
@@ -401,14 +420,6 @@ def _enrich_transactions(
         .withColumn(
             "prior_average_amount",
             F.coalesce(F.avg("amount").over(prior_window), F.lit(0.0)),
-        )
-        .withColumn(
-            "account_transaction_count",
-            F.count("transaction_id").over(Window.partitionBy("sender_account")),
-        )
-        .withColumn(
-            "account_average_amount",
-            F.avg("amount").over(Window.partitionBy("sender_account")),
         )
     )
 
@@ -420,7 +431,8 @@ def _enrich_transactions(
         & (F.to_date("timestamp") < F.col("account_created_at"))
     )
     repeated_near_threshold = (
-        F.col("near_threshold_count_24h") >= repeated_near_threshold_count
+        F.col("near_threshold_count_24h") + F.col("is_near_threshold")
+        >= repeated_near_threshold_count
     )
     high_velocity = F.col("velocity_24h") >= high_velocity_count
     risk_score = (

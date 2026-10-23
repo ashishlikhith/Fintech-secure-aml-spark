@@ -42,6 +42,13 @@ def get_spark_session() -> SparkSession:
         "SPARK_DEFAULT_PARALLELISM",
         config.get("spark.default.parallelism", "8"),
     )
+    for environment_name, spark_property in (
+        ("SPARK_DRIVER_MEMORY", "spark.driver.memory"),
+        ("SPARK_EXECUTOR_MEMORY", "spark.executor.memory"),
+    ):
+        memory_value = os.environ.get(environment_name)
+        if memory_value:
+            config[spark_property] = memory_value
     builder = SparkSession.builder.appName("Fintech-Secure-AML-Spark")
     for key, value in config.items():
         builder = builder.config(key, value)
