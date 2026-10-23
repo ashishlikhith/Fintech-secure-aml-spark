@@ -1,283 +1,320 @@
-"""Create compact charts from Spark summaries and held-out predictions."""
+"""Create AML distribution and model evaluation plots."""
 
 from pathlib import Path
-import math
-from typing import Mapping
+from typing import Any
 
 import matplotlib
 
-matplotlib.use("Agg")
-
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 from pyspark.sql import DataFrame
-from pyspark.sql import functions as F
 
 
-def _save_figure(figure: plt.Figure, output_path: Path) -> None:
-    figure.tight_layout()
-    figure.savefig(output_path, dpi=160, bbox_inches="tight")
-    plt.close(figure)
-    print(f"Visualization saved: {output_path}")
+PLOT_FILENAMES = [
+    "aml_class_distribution.png",
+    "correlation_heatmap.png",
+    "precision_recall_curves.png",
+    "roc_curves.png",
+    "top10_feature_importance.png",
+    "model_comparison.png",
+    "precision_recall_f1_comparison.png",
+    "confusion_matrices.png",
+]
+
+PLOT_TITLES = [
+    "AML class distribution",
+    "Correlation heatmap",
+    "Precision-recall curves",
+    "ROC curves",
+    "Top-10 feature importance",
+    "Model comparison",
+    "Precision/recall/F1 comparison",
+    "Confusion matrices",
+]
 
 
-def _plot_transaction_overview(base_df: DataFrame, output_dir: Path) -> None:
-    label_counts = (
-        base_df.groupBy("is_laundering")
-        .count()
-        .orderBy("is_laundering")
-        .toPandas()
-    )
-    daily = (
-        base_df.groupBy(F.to_date("timestamp").alias("date"))
-        .agg(
-            F.count("*").alias("transactions"),
-            F.count("is_laundering").alias("labeled_transactions"),
-            F.sum("is_laundering").alias("flagged"),
-        )
-        .withColumn(
-            "flag_rate", F.col("flagged") / F.col("labeled_transactions")
-        )
-        .orderBy("date")
-        .toPandas()
-    )
-    payment_types = (
-        base_df.groupBy("payment_type")
-        .agg(
-            F.count("*").alias("transactions"),
-            F.avg("is_laundering").alias("flag_rate"),
-        )
-        .orderBy(F.desc("transactions"))
-        .limit(12)
-        .toPandas()
-    )
-
-    figure, axes = plt.subplots(1, 3, figsize=(17, 5))
-    labels = label_counts["is_laundering"].fillna(-1).astype(str).replace(
-        {"0": "Not flagged", "1": "Flagged", "-1": "Unlabeled"}
-    )
-    sns.barplot(
-        x=labels,
-        y=label_counts["count"],
-        hue=labels,
-        legend=False,
-        ax=axes[0],
-        palette="viridis",
-    )
-    axes[0].set(title="Label balance", xlabel="", ylabel="Transactions")
-
-    if not daily.empty:
-        daily["date"] = pd.to_datetime(daily["date"])
-        sns.lineplot(data=daily, x="date", y="transactions", ax=axes[1], color="#3478a8")
-        axes[1].set(title="Transaction volume over time", xlabel="Date")
-        rate_axis = axes[1].twinx()
-        sns.lineplot(
-            data=daily,
-            x="date",
-            y="flag_rate",
-            ax=rate_axis,
-            color="#d1495b",
-            label="Flagged share",
-        )
-        rate_axis.set_ylabel("Flagged share")
-        rate_axis.set_ylim(0, 1)
-
-    if not payment_types.empty:
-        payment_types = payment_types.sort_values("flag_rate", ascending=False)
-        sns.barplot(
-            data=payment_types,
-            x="flag_rate",
-            y="payment_type",
-            hue="payment_type",
-            legend=False,
-            ax=axes[2],
-            palette="mako",
-        )
-        axes[2].set(
-            title="Flagged share by payment type",
-            xlabel="Flagged share",
-            ylabel="Payment type",
-            xlim=(0, 1),
-        )
-
-    _save_figure(figure, output_dir / "transaction_overview.png")
-
-
-def _plot_model_metrics(
-    model_results: Mapping[str, object], output_dir: Path
-) -> None:
-    comparison = model_results["comparison"]
-    if comparison is None:
-        print("Skipping model metric plots: no classifiers were evaluated.")
-        return
-    metrics = comparison.toPandas()
-    metrics.to_csv(output_dir / "model_metrics.csv", index=False)
-
-    figure, axis = plt.subplots(figsize=(10, 5))
-    metric_columns = ["precision", "recall", "f1", "area_under_pr"]
-    melted = metrics.melt(
-        id_vars="model", value_vars=metric_columns, var_name="metric", value_name="score"
-    )
-    sns.barplot(
-        data=melted,
-        x="metric",
-        y="score",
-        hue="model",
-        ax=axis,
-        palette="Set2",
-    )
-    axis.set(
-        title="Future-period model comparison (positive-class metrics)",
-        xlabel="Metric",
-        ylabel="Score",
-        ylim=(0, 1),
-    )
-    axis.tick_params(axis="x", rotation=20)
-    _save_figure(figure, output_dir / "model_comparison.png")
-
-
-def _plot_confusion_matrices(
-    model_results: Mapping[str, object], output_dir: Path
-) -> None:
-    classification_models = [
-        name
-        for name in (
-            "Decision Tree",
-            "Random Forest",
-            "Gradient-Boosted Trees",
-        )
-        if name in model_results["predictions"]
-    ]
-    if not classification_models:
-        return
-
-    figure, axes = plt.subplots(1, len(classification_models), figsize=(6 * len(classification_models), 5))
-    if len(classification_models) == 1:
-        axes = [axes]
-    for axis, name in zip(axes, classification_models):
-        predictions = model_results["predictions"][name]
-        matrix = (
-            predictions.groupBy("label", "prediction")
-            .count()
-            .toPandas()
-            .pivot(index="label", columns="prediction", values="count")
-            .fillna(0)
-        )
-        matrix = matrix.reindex(index=[0.0, 1.0], columns=[0.0, 1.0], fill_value=0)
-        sns.heatmap(
-            matrix,
-            annot=True,
-            fmt=".0f",
-            cmap="Blues",
-            cbar=False,
-            ax=axis,
-            xticklabels=["Not flagged", "Flagged"],
-            yticklabels=["Not flagged", "Flagged"],
-        )
-        axis.set(
-            title=f"{name} confusion matrix (future holdout)",
-            xlabel="Predicted",
-            ylabel="Actual",
-        )
-    _save_figure(figure, output_dir / "confusion_matrices.png")
-
-
-def _plot_feature_importance(
-    model_results: Mapping[str, object], output_dir: Path
-) -> None:
-    model_names = [
-        name
-        for name in ("Decision Tree", "Random Forest", "Gradient-Boosted Trees")
-        if name in model_results["models"]
-    ]
-    feature_names = model_results["feature_names"]
-    figure, axes = plt.subplots(
-        1, len(model_names), figsize=(6 * len(model_names), 7), squeeze=False
-    )
-    for axis, name in zip(axes[0], model_names):
-        model = model_results["models"][name]
-        importances = model.featureImportances.toArray()
-        if len(importances) != len(feature_names):
-            raise ValueError(
-                f"{name} importance count does not match the assembled features."
-            )
-        ranked = sorted(
-            zip(feature_names, importances), key=lambda item: item[1], reverse=True
-        )[:12]
-        labels = [item[0] for item in reversed(ranked)]
-        values = [float(item[1]) for item in reversed(ranked)]
-        axis.barh(labels, values, color="#3478a8")
-        axis.set(title=name, xlabel="Feature importance", ylabel="")
-    figure.suptitle("Top model feature importances")
-    _save_figure(figure, output_dir / "feature_importance.png")
-
-
-def _plot_transaction_flow_map(base_df: DataFrame, output_dir: Path) -> None:
-    edges = (
-        base_df.groupBy("sender_account", "receiver_account")
-        .agg(
-            F.count("*").alias("transactions"),
-            F.sum("is_laundering").alias("flagged"),
-        )
-        .orderBy(F.desc("transactions"))
-        .limit(30)
-        .toPandas()
-    )
-    if edges.empty:
-        return
-
-    accounts = sorted(set(edges["sender_account"]) | set(edges["receiver_account"]))
-    angle_step = 2 * 3.141592653589793 / len(accounts)
-    positions = {
-        account: (
-            1.4 * math.cos(index * angle_step),
-            1.4 * math.sin(index * angle_step),
-        )
-        for index, account in enumerate(accounts)
+def require_interactive_backend() -> None:
+    """Fail clearly unless Matplotlib has a desktop-window backend available."""
+    backend = matplotlib.get_backend().lower()
+    window_backends = {
+        "gtk3agg",
+        "gtk3cairo",
+        "gtk4agg",
+        "gtk4cairo",
+        "macosx",
+        "qtagg",
+        "qtcairo",
+        "qt5agg",
+        "qt5cairo",
+        "tkagg",
+        "tkcairo",
+        "wx",
+        "wxagg",
+        "wxcairo",
     }
-    figure, axis = plt.subplots(figsize=(11, 9))
-    maximum = max(float(edges["transactions"].max()), 1.0)
-    for row in edges.itertuples(index=False):
-        x1, y1 = positions[row.sender_account]
-        x2, y2 = positions[row.receiver_account]
-        flagged_share = float(row.flagged or 0) / max(int(row.transactions), 1)
-        axis.annotate(
-            "",
-            xy=(x2, y2),
-            xytext=(x1, y1),
-            arrowprops={
-                "arrowstyle": "->",
-                "color": "#c84c4c" if flagged_share > 0 else "#7695a5",
-                "alpha": 0.25 + 0.65 * flagged_share,
-                "linewidth": 0.5 + 3 * int(row.transactions) / maximum,
-                "shrinkA": 12,
-                "shrinkB": 12,
-            },
+    if backend not in window_backends:
+        raise RuntimeError(
+            f"Interactive chart windows require a GUI Matplotlib backend; "
+            f"the selected backend is {matplotlib.get_backend()!r}. On Windows, "
+            "configure TkAgg (built into this Python installation) or QtAgg "
+            "with a compatible Qt package; do not use Agg."
         )
-    xs, ys = zip(*(positions[account] for account in accounts))
-    axis.scatter(xs, ys, s=700, color="#356d8a", edgecolor="white", zorder=3)
-    for account, (x, y) in positions.items():
-        axis.text(x, y, account, ha="center", va="center", color="white", fontsize=7, zorder=4)
-    axis.set(
-        title="Transaction-flow map (top 30 account pairs; red = labeled activity)",
-        aspect="equal",
+
+
+def display_saved_visualizations(output_dir: str) -> list[Path]:
+    """Display the eight existing PNGs in order without training models again."""
+    require_interactive_backend()
+    output_path = Path(output_dir)
+    plot_paths = [output_path / filename for filename in PLOT_FILENAMES]
+    missing = [path for path in plot_paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Cannot display saved charts; missing files: "
+            + ", ".join(str(path) for path in missing)
+        )
+
+    for plot_path, title in zip(plot_paths, PLOT_TITLES):
+        figure, axis = plt.subplots()
+        try:
+            axis.imshow(plt.imread(plot_path))
+            axis.set_title(title)
+            axis.axis("off")
+            figure.tight_layout()
+            print(f"Displaying saved chart: {plot_path}")
+            plt.show(block=True)
+        finally:
+            plt.close(figure)
+    return plot_paths
+
+
+def _curve_points(
+    labels: list[int], scores: list[float]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build tied-score-aware precision-recall and ROC curve coordinates."""
+    label_values = np.asarray(labels, dtype=np.int8)
+    score_values = np.asarray(scores, dtype=np.float64)
+    order = np.argsort(-score_values, kind="mergesort")
+    sorted_scores = score_values[order]
+    sorted_labels = label_values[order]
+    group_ends = np.r_[
+        np.flatnonzero(sorted_scores[:-1] != sorted_scores[1:]),
+        len(sorted_scores) - 1,
+    ]
+    true_positives = np.cumsum(sorted_labels == 1)[group_ends]
+    false_positives = group_ends + 1 - true_positives
+    positive_count = int(np.count_nonzero(label_values == 1))
+    negative_count = len(label_values) - positive_count
+    precision = true_positives / (true_positives + false_positives)
+    recall = true_positives / positive_count
+    true_positive_rate = true_positives / positive_count
+    false_positive_rate = false_positives / negative_count
+    return (
+        np.r_[0.0, recall],
+        np.r_[1.0, precision],
+        np.r_[0.0, false_positive_rate, 1.0],
+        np.r_[0.0, true_positive_rate, 1.0],
     )
-    axis.axis("off")
-    _save_figure(figure, output_dir / "transaction_flow_map.png")
 
 
-def create_pipeline_visualizations(
-    base_df: DataFrame,
-    model_results: Mapping[str, object],
+def create_visualizations(
+    transactions: DataFrame,
+    model_metrics: list[dict[str, Any]],
     output_dir: str,
-) -> None:
-    """Write bounded-size overview, model-evaluation, and flow-map plots."""
-    sns.set_theme(style="whitegrid")
+    show_interactive: bool = True,
+) -> list[Path]:
+    """Save eight distinct class balance, feature, and model evaluation plots."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    _plot_transaction_overview(base_df, output_path)
-    _plot_model_metrics(model_results, output_path)
-    _plot_confusion_matrices(model_results, output_path)
-    _plot_feature_importance(model_results, output_path)
-    _plot_transaction_flow_map(base_df, output_path)
+    if show_interactive:
+        require_interactive_backend()
+    sns.set_theme(style="whitegrid")
+    saved_paths: list[Path] = []
+
+    def save_plot(figure: plt.Figure, filename: str) -> None:
+        plot_path = output_path / filename
+        try:
+            figure.savefig(plot_path, dpi=150)
+            if show_interactive:
+                print(f"Displaying chart: {plot_path}")
+                plt.show(block=True)
+        finally:
+            plt.close(figure)
+        saved_paths.append(plot_path)
+        print(f"Saved plot: {plot_path}")
+
+    counts = transactions.groupBy("is_laundering").count().toPandas()
+    counts["class"] = counts["is_laundering"].map(
+        {0: "Not laundering", 1: "Laundering"}
+    )
+    total_rows = int(counts["count"].sum())
+    counts["percentage"] = counts["count"] / total_rows * 100
+    figure, axis = plt.subplots(figsize=(7, 4))
+    bars = sns.barplot(
+        data=counts, x="class", y="count", hue="class", legend=False, ax=axis
+    )
+    for bar, (_, row) in zip(bars.patches, counts.iterrows()):
+        bar.axes.annotate(
+            f"{int(row['count']):,}\n({row['percentage']:.2f}%)",
+            (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+            ha="center",
+            va="bottom",
+            xytext=(0, 4),
+            textcoords="offset points",
+        )
+    axis.set(title="IBM AML transaction class distribution", xlabel="", ylabel="Rows")
+    figure.tight_layout()
+    save_plot(figure, "aml_class_distribution.png")
+
+    correlation_sample = (
+        transactions.select("amount", "is_near_threshold")
+        .sample(False, 0.1, seed=42)
+        .limit(20_000)
+        .toPandas()
+    )
+    if correlation_sample.empty:
+        correlation_sample = transactions.select(
+            "amount", "is_near_threshold"
+        ).limit(20_000).toPandas()
+    figure, axis = plt.subplots(figsize=(5, 4))
+    sns.heatmap(
+        correlation_sample.corr(numeric_only=True),
+        annot=True,
+        cmap="coolwarm",
+        center=0,
+        ax=axis,
+    )
+    axis.set_title("Correlation of simple numeric transaction features")
+    figure.tight_layout()
+    save_plot(figure, "correlation_heatmap.png")
+
+    for curve_name, filename, x_label, y_label, title in (
+        (
+            "precision_recall",
+            "precision_recall_curves.png",
+            "Recall",
+            "Precision",
+            "Precision–recall curves on the chronological test split",
+        ),
+        (
+            "roc",
+            "roc_curves.png",
+            "False positive rate",
+            "True positive rate",
+            "ROC curves on the chronological test split",
+        ),
+    ):
+        figure, axis = plt.subplots(figsize=(7, 5))
+        for result in model_metrics:
+            recall, precision, false_positive_rate, true_positive_rate = (
+                _curve_points(
+                    result["_test_labels"], result["_test_probabilities"]
+                )
+            )
+            if curve_name == "precision_recall":
+                axis.plot(recall, precision, label=str(result["model"]))
+            else:
+                axis.plot(
+                    false_positive_rate,
+                    true_positive_rate,
+                    label=str(result["model"]),
+                )
+        if curve_name == "roc":
+            axis.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Chance")
+        else:
+            prevalence = float(np.mean(model_metrics[0]["_test_labels"]))
+            axis.axhline(
+                prevalence,
+                linestyle="--",
+                color="gray",
+                label=f"Test prevalence ({prevalence:.3%})",
+            )
+        axis.set(
+            title=title,
+            xlabel=x_label,
+            ylabel=y_label,
+            xlim=(0, 1),
+            ylim=(0, 1),
+        )
+        axis.legend(loc="best")
+        figure.tight_layout()
+        save_plot(figure, filename)
+
+    forest_result = next(
+        (
+            result
+            for result in model_metrics
+            if "_feature_importances" in result
+        ),
+        None,
+    )
+    if forest_result is None:
+        raise ValueError("Random Forest feature importances are required for plotting.")
+    importance = pd.DataFrame(
+        [
+            {"feature": name, "importance": value}
+            for name, value in forest_result["_feature_importances"].items()
+        ]
+    ).sort_values("importance", ascending=False).head(10)
+    figure, axis = plt.subplots(figsize=(8, 4))
+    sns.barplot(
+        data=importance,
+        x="importance",
+        y="feature",
+        hue="feature",
+        legend=False,
+        ax=axis,
+    )
+    axis.set(
+        title="Top feature importances (RandomForestClassifier)",
+        xlabel="Importance",
+        ylabel="Feature",
+    )
+    figure.tight_layout()
+    save_plot(figure, "top10_feature_importance.png")
+
+    for metric_columns, filename, title in (
+        (
+            ["accuracy", "pr_auc", "roc_auc"],
+            "model_comparison.png",
+            "Accuracy and ranking metric comparison",
+        ),
+        (
+            ["precision", "recall", "f1"],
+            "precision_recall_f1_comparison.png",
+            "Precision, recall, and F1 comparison",
+        ),
+    ):
+        comparison = pd.DataFrame(model_metrics).melt(
+            id_vars="model",
+            value_vars=metric_columns,
+            var_name="metric",
+            value_name="score",
+        )
+        figure, axis = plt.subplots(figsize=(9, 5))
+        sns.barplot(data=comparison, x="metric", y="score", hue="model", ax=axis)
+        axis.set(title=title, xlabel="Metric", ylabel="Score", ylim=(0, 1))
+        axis.legend(title="Model")
+        figure.tight_layout()
+        save_plot(figure, filename)
+
+    figure, axes = plt.subplots(
+        1, len(model_metrics), figsize=(5 * len(model_metrics), 4)
+    )
+    if len(model_metrics) == 1:
+        axes = [axes]
+    for axis, metrics in zip(axes, model_metrics):
+        matrix = pd.DataFrame(
+            [[metrics["tn"], metrics["fp"]], [metrics["fn"], metrics["tp"]]],
+            index=["Actual negative", "Actual positive"],
+            columns=["Predicted negative", "Predicted positive"],
+        )
+        sns.heatmap(matrix, annot=True, fmt="d", cmap="Blues", cbar=False, ax=axis)
+        axis.set_title(str(metrics["model"]))
+        axis.set_xlabel("Prediction")
+        axis.set_ylabel("Actual")
+    figure.suptitle("Confusion matrices on the chronological test split")
+    figure.tight_layout()
+    save_plot(figure, "confusion_matrices.png")
+    return saved_paths

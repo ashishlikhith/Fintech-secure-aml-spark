@@ -1,150 +1,101 @@
-# Fintech Secure AML Spark
+# Simple PySpark AML Project
 
-A local PySpark demonstration that creates a fixed-seed, stratified sample of
-500,000 transactions from the existing IBM AMLSim **HI-Small** CSV, builds
-illustrative risk signals, trains three classifiers on chronological splits,
-runs Spark SQL summaries, and saves metrics and visualizations.
+This project uses the existing IBM AMLSim **HI-Small** transaction dataset to
+demonstrate Spark data preparation, Spark SQL, and three supervised
+classifiers. AMLSim is simulated data; a model prediction is not proof of
+money laundering or a decision for real banking activity.
 
-AMLSim records and labels are simulated benchmark data. Predictions and risk
-scores are not verified fraud determinations and must not be used as proof of
-misconduct. The near-threshold signal is illustrative, not a legal reporting
-threshold.
+## Run on Windows
 
-## Requirements
-
-- Use the existing Python, Java, and PySpark setup; this project does not
-  upgrade or replace them.
-- Project dependencies are in `requirements.txt`.
-- The default local Spark master is `local[2]`, with 32 SQL shuffle partitions.
-- The sample seed defaults to `42`; Python, Java, and Spark versions are not
-  modified by this project.
-
-## Run on Windows PowerShell
-
-From the project root:
+Place the original `HI-Small_Trans.csv` at `data\HI-Small_Trans.csv`, then run
+from the project folder:
 
 ```powershell
 python main.py
 ```
 
-The project reads the original `data\HI-Small_Trans.csv` without changing it,
-then creates or reuses `data\HI-Small_Trans_sample_500000.csv`. Sampling is
-stratified on the AML label and uses seed 42 by default. Training, validation,
-and test data are made from this saved sample.
-
-To choose a different saved-sample path, or explicitly set the sample size
-and seed:
+The eight plots are saved and opened one at a time; close each chart window to
+continue. To reopen the existing PNGs without rerunning Spark or model training,
+use:
 
 ```powershell
-python main.py --data-path "data\HI-Small_Trans.csv" `
-  --sample-path "data\HI-Small_Trans_sample_500000.csv" `
-  --sample-size 500000 --sample-seed 42 `
-  --output-dir "artifacts\hi-small-500k"
+python main.py --show-saved-plots
 ```
 
-Optional settings:
+Interactive chart windows require a desktop Matplotlib backend. On Windows,
+`TkAgg` is supported by the standard Tk installation; if another backend is
+selected, the program stops with instructions instead of silently saving
+without displaying the charts.
 
-```powershell
-python main.py --help
-```
+The program creates the reproducible, class-stratified 500,000-row sample at
+`data\HI-Small_Trans_sample_500000.csv` with seed `42`. The original dataset is
+not edited. This project does not install or change Python, Java, PySpark,
+Apache Spark, or Spark Shell.
 
-## Pipeline and outputs
+## Pipeline and evaluation
 
-The pipeline validates and cleans transaction fields, derives account IDs
-from bank/account pairs, computes prior-transaction and near-threshold
-features, and creates explainable rule-based risk scores. Missing numeric
-features are imputed with zero; rows with invalid timestamps, missing required
-fields, negative amounts, or non-binary labels are excluded from modeling.
-Unlabeled rows can remain in transaction analysis but are not included in
-supervised training or evaluation.
+1. Reads the IBM CSV, reports the source row and AML class counts, then writes
+   an exact-size sample preserving the source class proportions as closely as
+   integer row counts allow.
+2. Parses timestamps and amounts, removes invalid records, and creates sender
+   and receiver account IDs from bank and account fields. The only engineered
+   feature is an amount-range indicator for values between 9,000 and 10,000.
+3. Splits by chronological timestamp quantiles into training, validation, and
+   future test periods. The run reports each split's row count and AML-positive
+   prevalence. Changing prevalence is retained and reported as temporal
+   distribution shift rather than hidden by random stratification.
+4. Uses only `amount`, `is_near_threshold`, and a payment-format index as model
+   features. Timestamps, account IDs, transaction IDs, and the label are
+   excluded. The payment index and class weights are fit from training data
+   only.
+5. Trains exactly `DecisionTreeClassifier`, `RandomForestClassifier`, and
+   `GBTClassifier`. Each model selects its own probability threshold by
+   validation F1, then computes its threshold metrics and confusion counts
+   from its own future test predictions. PR-AUC and ROC-AUC use that model's
+   own continuous test scores. Identical threshold metrics can occur naturally
+   and are not altered to force differences.
+6. Prints and saves one test-score table with accuracy, precision, recall,
+   F1-score, PR-AUC, ROC-AUC, TP/TN/FP/FN, and the selected threshold. The
+   beginning and end reports include source/sample/split class counts,
+   prevalences, feature names, evaluated rows, per-model training times, and
+   total runtime.
+7. Executes all seven Spark SQL queries against the registered `transactions`
+   Spark view. Each query's name and result row count are printed, followed by
+   the actual first ten rows; all results are also saved as CSV.
 
-Training, validation, and test data are disjoint chronological 60/20/20 time
-periods. The run prints and saves each split's row count, AML-positive count,
-and positive proportion. Preprocessing is fitted on training data only. The
-transaction ID and timestamp determine split membership but are excluded from
-model features; rolling features use only prior transactions. Class weights
-are applied to training data. The validation period selects a probability
-threshold for F1. Test metrics include precision, recall, F1, PR-AUC, ROC-AUC,
-and all four confusion-matrix counts. Each split must contain both labels or
-the run stops with its class counts.
+The fixed local Spark settings use two worker threads and eight shuffle
+partitions. Prepared transactions are cached on disk and released before Spark
+shuts down.
 
-Exactly three supervised classifiers are used:
+## Output files
 
-1. `DecisionTreeClassifier`
-2. `RandomForestClassifier`
-3. `GBTClassifier`
+The run writes all outputs under `artifacts\hi-small-500k\`:
 
-No other classifier or unsupervised model is included. A model training,
-evaluation, SQL, or output-writing error stops the run rather than being
-reported as a successful pipeline.
-
-Outputs are written to `artifacts\hi-small\` by default:
-
-- `correlation_heatmap.png`
-- `transaction_overview.png`
-- `model_comparison.png` (precision, recall, F1, and PR-AUC)
-- `confusion_matrices.png`
-- `feature_importance.png`
-- `transaction_flow_map.png`
 - `model_metrics.csv`
-- `metrics\model_metrics.csv`
-- `metrics\evaluation_summary.json`
-- `sql\*.csv` (bounded summaries and top-risk/pattern rows)
+- `aml_class_distribution.png` (counts and percentages)
+- `correlation_heatmap.png`
+- `model_comparison.png` (accuracy, PR-AUC, and ROC-AUC)
+- `confusion_matrices.png`
+- `precision_recall_curves.png`
+- `roc_curves.png`
+- `top10_feature_importance.png`
+- `precision_recall_f1_comparison.png`
+- `sql\*.csv` for the seven query results
 
-Spark stores the enriched data and model feature/prediction frames with
-disk-only persistence and unpersists them after use. The Random Forest uses
-12 trees, depth 4, and square-root feature selection; Decision Tree depth is
-4 and GBT uses 8 iterations at depth 3. SQL summaries and chart inputs are
-bounded before transfer to Python. No Spark model objects are saved.
+Every generated visualization and the metrics/SQL CSV paths are printed.
 
-Spark `MemoryStore` warnings indicate that some blocks could not remain in
-memory and were written to disk. Such warnings alone do not establish a Java
-heap failure. Keep sufficient free disk space for Spark's cache and spill
-files; inspect the run log for any actual exception.
+## Python files and tests
 
-## Spark SQL analyses
+- `main.py` runs the stages and always stops the Spark session.
+- `data_processing.py` samples the original data, cleans transaction fields,
+  creates account IDs, and adds the amount feature.
+- `spark_sql.py` contains and executes the seven SQL queries.
+- `ml_models.py` makes chronological splits, trains the three classifiers,
+  selects validation thresholds, and calculates test metrics.
+- `visualizations.py` creates the AML and model evaluation plots.
 
-The pipeline executes and saves bounded outputs for transaction totals,
-suspicious transactions by risk category, highest-risk transactions, payment
-type summaries, near-threshold sender patterns, and sender/receiver patterns.
-It also demonstrates beginner SQL concepts on at most 100 transaction rows:
-DataFrame-to-RDD-to-DataFrame conversion using `RDD.toDF()`, temporary views,
-`SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, aggregate functions, `INNER JOIN`,
-and `LIKE '%WIRE%'`. The example is deliberately bounded; the AML summaries
-run against the saved 500,000-row sample. The entry point prints the DataFrame
-schema and five example rows without sorting or collecting the full dataset.
-
-## Python files
-
-- `main.py`: command-line entry point; runs the stages in order and
-  reads the Spark settings, validates transactions, builds account activity
-  and illustrative risk features, and writes the bounded SQL query results.
-- `ml_models.py`: selects model inputs, handles missing numeric values,
-  creates the Spark-computed correlation heatmap, makes chronological
-  train/validation/test splits, trains the three classifiers, and saves
-  evaluation metrics.
-- `spark_sql.py`: registers SQL views, creates the small RDD lesson,
-  and holds the AML and syllabus query examples.
-- `visualizations.py`: creates the transaction, model-comparison,
-  confusion-matrix, feature-importance, and transaction-flow plots.
-- `tests/test_pipeline.py`: exercises the pipeline with small generated data.
-
-The AML task is a classification problem, so the project reports a confusion
-matrix, precision, recall, F1, PR-AUC, and ROC-AUC. RMSE, MAE, and R-squared
-are regression metrics and are not applicable to these classifiers. Linear
-and logistic regression, K-means, SVM, and Naive Bayes are not mixed into the
-three-model AML comparison; they can be practised as separate syllabus
-exercises. K-means is not part of this project.
-
-## Tests
-
-Run:
+Run the generated-data checks with:
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
-
-The tests use small generated fixtures for deterministic checks of input
-validation, feature engineering, class weighting and evaluation, SQL, and
-visualizations. The end-to-end HI-Small run is the integration check against
-the supplied benchmark.
