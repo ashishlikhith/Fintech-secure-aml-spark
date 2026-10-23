@@ -1,0 +1,9 @@
+user_id|full_name|device_id|contact_email|signup_country|account_created_at
+U001|Synthetic Customer 001|device-001|contact001@example.test|US|2024-01-03
+U002|Synthetic Customer 002|device-shared-01|shared01@example.test|US|2024-02-11
+U003|Synthetic Customer 003|device-003|contact003@example.test|CA|2024-03-08
+U004|Synthetic Customer 004|device-shared-02|contact004@example.test|GB|2024-04-19
+U005|Synthetic Customer 005|device-005|contact005@example.test|US|2024-05-02
+U006|Synthetic Customer 006|device-006|contact006@example.test|CA|2024-06-14
+U007|Synthetic Customer 007|device-shared-02|shared01@example.test|GB|2024-07-07
+U008|Synthetic Customer 008|device-008|contact008@example.test|US|2024-08-21

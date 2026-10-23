@@ -1,0 +1,5 @@
+pyspark==3.5.9
+matplotlib>=3.7,<4
+pandas>=2,<3
+seaborn>=0.13,<1
+kagglehub>=0.3,<1
