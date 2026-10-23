@@ -1,9 +1,9 @@
 # Fintech Secure AML Spark
 
-A local PySpark demonstration that analyzes the IBM AMLSim **HI-Small**
-transaction CSV, creates illustrative risk signals, trains exactly three
-classifiers, evaluates them on a chronological holdout, runs Spark SQL
-summaries, and writes metrics and visualizations.
+A local PySpark demonstration that creates a fixed-seed, stratified sample of
+500,000 transactions from the existing IBM AMLSim **HI-Small** CSV, builds
+illustrative risk signals, trains three classifiers on chronological splits,
+runs Spark SQL summaries, and saves metrics and visualizations.
 
 AMLSim records and labels are simulated benchmark data. Predictions and risk
 scores are not verified fraud determinations and must not be used as proof of
@@ -15,8 +15,9 @@ threshold.
 - Use the existing Python, Java, and PySpark setup; this project does not
   upgrade or replace them.
 - Project dependencies are in `requirements.txt`.
-- The default local Spark master is `local[2]`, with 32 SQL shuffle partitions
-  to moderate per-partition work on the supplied dataset.
+- The default local Spark master is `local[2]`, with 32 SQL shuffle partitions.
+- The sample seed defaults to `42`; Python, Java, and Spark versions are not
+  modified by this project.
 
 ## Run on Windows PowerShell
 
@@ -26,14 +27,19 @@ From the project root:
 python main.py
 ```
 
-This reads the smaller `data\HI-Small_Trans.csv` benchmark (about 476 MB),
-not the 3 GB HI-Medium file. The command deliberately
-accepts only a file named `HI-Small_Trans.csv`; it cannot select the medium or
-large benchmark. To specify another copy of the small CSV:
+The project reads the original `data\HI-Small_Trans.csv` without changing it,
+then creates or reuses `data\HI-Small_Trans_sample_500000.csv`. Sampling is
+stratified on the AML label and uses seed 42 by default. Training, validation,
+and test data are made from this saved sample.
+
+To choose a different saved-sample path, or explicitly set the sample size
+and seed:
 
 ```powershell
-python main.py --data-path "C:\data\HI-Small_Trans.csv" `
-  --output-dir "artifacts\hi-small"
+python main.py --data-path "data\HI-Small_Trans.csv" `
+  --sample-path "data\HI-Small_Trans_sample_500000.csv" `
+  --sample-size 500000 --sample-seed 42 `
+  --output-dir "artifacts\hi-small-500k"
 ```
 
 Optional settings:
@@ -52,12 +58,15 @@ fields, negative amounts, or non-binary labels are excluded from modeling.
 Unlabeled rows can remain in transaction analysis but are not included in
 supervised training or evaluation.
 
-Training, validation, and test data are chronological 60/20/20 time periods.
-Preprocessing is learned on training data only. Class weights are applied to
-the training period to address label imbalance. The validation period selects
-a probability threshold for F1; the final period reports precision, recall,
-F1, false-positive/negative counts, PR-AUC, and ROC-AUC. Each split must
-contain both labels or the run stops with its class counts.
+Training, validation, and test data are disjoint chronological 60/20/20 time
+periods. The run prints and saves each split's row count, AML-positive count,
+and positive proportion. Preprocessing is fitted on training data only. The
+transaction ID and timestamp determine split membership but are excluded from
+model features; rolling features use only prior transactions. Class weights
+are applied to training data. The validation period selects a probability
+threshold for F1. Test metrics include precision, recall, F1, PR-AUC, ROC-AUC,
+and all four confusion-matrix counts. Each split must contain both labels or
+the run stops with its class counts.
 
 Exactly three supervised classifiers are used:
 
@@ -82,15 +91,16 @@ Outputs are written to `artifacts\hi-small\` by default:
 - `metrics\evaluation_summary.json`
 - `sql\*.csv` (bounded summaries and top-risk/pattern rows)
 
-Spark caches the enriched data and model feature/prediction frames on disk
-rather than keeping the full dataset in JVM memory. SQL summaries and chart
-inputs are bounded before they are transferred to Python. Spark model objects
-are not persisted; metrics, evaluation summaries, SQL results, and plots are
-the saved deliverables.
+Spark stores the enriched data and model feature/prediction frames with
+disk-only persistence and unpersists them after use. The Random Forest uses
+12 trees, depth 4, and square-root feature selection; Decision Tree depth is
+4 and GBT uses 8 iterations at depth 3. SQL summaries and chart inputs are
+bounded before transfer to Python. No Spark model objects are saved.
 
-The HI-Small run emitted Spark `MemoryStore` cache warnings; the corresponding
-blocks fell back to disk, and the pipeline completed without a heap or Py4J
-error. Keep sufficient free disk space for Spark's local spill/cache files.
+Spark `MemoryStore` warnings indicate that some blocks could not remain in
+memory and were written to disk. Such warnings alone do not establish a Java
+heap failure. Keep sufficient free disk space for Spark's cache and spill
+files; inspect the run log for any actual exception.
 
 ## Spark SQL analyses
 
@@ -101,7 +111,7 @@ It also demonstrates beginner SQL concepts on at most 100 transaction rows:
 DataFrame-to-RDD-to-DataFrame conversion using `RDD.toDF()`, temporary views,
 `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, aggregate functions, `INNER JOIN`,
 and `LIKE '%WIRE%'`. The example is deliberately bounded; the AML summaries
-run against the full HI-Small input. The entry point prints the DataFrame
+run against the saved 500,000-row sample. The entry point prints the DataFrame
 schema and five example rows without sorting or collecting the full dataset.
 
 ## Python files

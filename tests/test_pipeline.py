@@ -15,6 +15,7 @@ from spark_sql import run_sql_analytics
 from visualizations import create_pipeline_visualizations
 from main import (
     _resolve_transaction_file,
+    create_stratified_sample,
     run_data_engineering,
     run_ibm_data_engineering,
 )
@@ -157,6 +158,58 @@ class SparkPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "HI-Small_Trans.csv"):
                 _resolve_transaction_file(str(medium))
 
+    def test_stratified_sample_has_exact_size_and_reuses_saved_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "HI-Small_Trans.csv"
+            sample_path = Path(directory) / "HI-Small_Trans_sample.csv"
+            with source.open("w", encoding="utf-8", newline="") as output:
+                writer = csv.writer(output)
+                writer.writerow(
+                    [
+                        "Timestamp",
+                        "From Bank",
+                        "Account",
+                        "To Bank",
+                        "Account",
+                        "Amount Received",
+                        "Receiving Currency",
+                        "Amount Paid",
+                        "Payment Currency",
+                        "Payment Format",
+                        "Is Laundering",
+                    ]
+                )
+                for index in range(10):
+                    writer.writerow(
+                        [
+                            f"2022/09/01 00:{index:02}",
+                            1,
+                            1001 + index,
+                            2,
+                            2001 + index,
+                            100,
+                            "US Dollar",
+                            100,
+                            "US Dollar",
+                            "ACH",
+                            int(index in {2, 7}),
+                        ]
+                    )
+            original_bytes = source.read_bytes()
+
+            saved_sample_path = create_stratified_sample(
+                self.spark, str(source), str(sample_path), sample_size=5, seed=731
+            )
+            reused_sample_path = create_stratified_sample(
+                self.spark, str(source), str(sample_path), sample_size=5, seed=731
+            )
+            sample = self.spark.read.option("header", "true").csv(saved_sample_path)
+
+            self.assertEqual(saved_sample_path, reused_sample_path)
+            self.assertEqual(sample.count(), 5)
+            self.assertEqual(sample.filter("`Is Laundering` = '1'").count(), 1)
+            self.assertEqual(source.read_bytes(), original_bytes)
+
     def test_reusable_bounded_aml_sql_queries(self) -> None:
         results = run_sql_analytics(self.spark, transactions=self.base_df)
         self.assertEqual(results["transaction_totals"].count(), 1)
@@ -262,6 +315,8 @@ class SparkPipelineTests(unittest.TestCase):
         self.assertEqual(metrics["recall"], 0.5)
         self.assertEqual(metrics["false_positives"], 1)
         self.assertEqual(metrics["false_negatives"], 1)
+        self.assertEqual(metrics["true_positives"], 1)
+        self.assertEqual(metrics["true_negatives"], 0)
         self.assertAlmostEqual(metrics["positive_rate"], 2 / 3)
 
     def test_y_invalid_and_duplicate_transaction_rows_are_reported(self) -> None:

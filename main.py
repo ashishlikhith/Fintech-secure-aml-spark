@@ -1,6 +1,8 @@
 import argparse
 import csv
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from time import perf_counter
 
@@ -210,6 +212,147 @@ def _ibm_column_indexes(path: str) -> dict[str, int]:
         )
     indexes["column_count"] = len(header)
     return indexes
+
+
+def create_stratified_sample(
+    spark: SparkSession,
+    source_path: str,
+    sample_path: str,
+    sample_size: int = 500_000,
+    seed: int = 42,
+) -> str:
+    """Create or reuse an exact-size reproducible sample stratified by label."""
+    if sample_size <= 0:
+        raise ValueError("sample_size must be greater than zero")
+    _require_file(source_path, "IBM transaction")
+    source_indexes = _ibm_column_indexes(source_path)
+    with Path(source_path).open(encoding="utf-8-sig", newline="") as source_file:
+        header = next(csv.reader(source_file))
+
+    source_columns = [
+        f"source_{index}" for index in range(source_indexes["column_count"])
+    ]
+    source_schema = StructType(
+        [StructField(column, StringType(), True) for column in source_columns]
+    )
+    source = (
+        spark.read.option("header", "false")
+        .option("mode", "PERMISSIVE")
+        .schema(source_schema)
+        .csv(source_path)
+        .filter(
+            F.lower(
+                F.regexp_replace(
+                    F.trim(F.col(source_columns[source_indexes["timestamp"]])),
+                    "^\ufeff",
+                    "",
+                )
+            )
+            != "timestamp"
+        )
+        .withColumn(
+            "_sample_label",
+            F.trim(F.col(source_columns[source_indexes["is_laundering"]])).cast(
+                "int"
+            ),
+        )
+        .filter(F.col("_sample_label").isin(0, 1))
+    )
+    source_counts = {
+        int(row["_sample_label"]): int(row["count"])
+        for row in source.groupBy("_sample_label").count().collect()
+    }
+    source_rows = sum(source_counts.values())
+    positive_rows = source_counts.get(1, 0)
+    negative_rows = source_counts.get(0, 0)
+    if not positive_rows or not negative_rows:
+        raise ValueError(
+            "IBM CSV must contain both AML-positive and AML-negative rows."
+        )
+    if source_rows < sample_size:
+        raise ValueError(
+            f"Requested {sample_size:,} rows, but only {source_rows:,} labeled "
+            "rows are available."
+        )
+    positive_quota = round(sample_size * positive_rows / source_rows)
+    positive_quota = min(max(positive_quota, 1), sample_size - 1)
+    negative_quota = sample_size - positive_quota
+    if positive_quota > positive_rows or negative_quota > negative_rows:
+        raise ValueError("The requested sample size cannot preserve both classes.")
+
+    source_rate = positive_rows / source_rows
+    print(
+        f"Source class distribution: rows={source_rows:,}, "
+        f"AML-positive={positive_rows:,} ({source_rate:.6%}), "
+        f"AML-negative={negative_rows:,} ({1 - source_rate:.6%})."
+    )
+
+    output_path = Path(sample_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not output_path.exists():
+        sampled_groups = []
+        for label, quota in ((0, negative_quota), (1, positive_quota)):
+            sampled_groups.append(
+                source.filter(F.col("_sample_label") == label)
+                .orderBy(F.rand(seed))
+                .limit(quota)
+                .select(*source_columns)
+            )
+        sampled = sampled_groups[0].unionByName(sampled_groups[1])
+        with tempfile.TemporaryDirectory(
+            prefix=".aml-sample-", dir=str(output_path.parent)
+        ) as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            csv_directory = temporary_root / "csv"
+            sampled.coalesce(1).write.mode("error").option("header", "false").csv(
+                str(csv_directory)
+            )
+            part_file = next(csv_directory.glob("part-*.csv"), None)
+            if part_file is None:
+                raise RuntimeError("Spark did not create the sampled CSV output.")
+            temporary_sample = temporary_root / output_path.name
+            with temporary_sample.open("w", encoding="utf-8", newline="") as output:
+                csv.writer(output).writerow(header)
+                with part_file.open("r", encoding="utf-8", newline="") as rows:
+                    shutil.copyfileobj(rows, output)
+            os.replace(temporary_sample, output_path)
+
+    sample = (
+        spark.read.option("header", "true")
+        .schema(source_schema)
+        .csv(str(output_path))
+    )
+    sample_counts = {
+        int(row["_sample_label"]): int(row["count"])
+        for row in sample.withColumn(
+            "_sample_label",
+            F.trim(F.col(source_columns[source_indexes["is_laundering"]])).cast(
+                "int"
+            ),
+        )
+        .groupBy("_sample_label")
+        .count()
+        .collect()
+    }
+    sample_rows = sum(sample_counts.values())
+    sample_positive = sample_counts.get(1, 0)
+    sample_rate = sample_positive / sample_rows if sample_rows else 0.0
+    if sample_rows != sample_size or sample_counts != {
+        0: negative_quota,
+        1: positive_quota,
+    }:
+        raise ValueError(
+            f"Sample verification failed: expected {sample_size:,} rows and "
+            f"class counts {{0: {negative_quota}, 1: {positive_quota}}}, "
+            f"got {sample_rows:,} rows and {sample_counts}."
+        )
+    print(
+        f"Sample class distribution: rows={sample_rows:,}, "
+        f"AML-positive={sample_positive:,} ({sample_rate:.6%}), "
+        f"AML-negative={sample_counts[0]:,} ({1 - sample_rate:.6%})."
+    )
+    print(f"Reproducible sample saved at: {output_path}")
+    return str(output_path)
 
 
 def run_ibm_data_engineering(
@@ -556,9 +699,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-path",
         default="data/HI-Small_Trans.csv",
-        help="Path to HI-Small_Trans.csv (relative paths are based at the project root).",
+        help="Original HI-Small_Trans.csv path (relative paths use the project root).",
     )
-    parser.add_argument("--output-dir", default="artifacts/hi-small")
+    parser.add_argument(
+        "--sample-path",
+        default="data/HI-Small_Trans_sample_500000.csv",
+        help="CSV path for the reusable stratified sample.",
+    )
+    parser.add_argument("--sample-size", type=int, default=500_000)
+    parser.add_argument(
+        "--sample-seed", type=int, default=42, help="Fixed random seed for sampling."
+    )
+    parser.add_argument("--output-dir", default="artifacts/hi-small-500k")
     parser.add_argument(
         "--near-threshold",
         type=float,
@@ -580,14 +732,24 @@ def main() -> int:
         raise ValueError("--lookback-hours must be greater than zero")
     if args.near_threshold <= 0:
         raise ValueError("--near-threshold must be greater than zero")
+    if args.sample_size <= 0:
+        raise ValueError("--sample-size must be greater than zero")
 
-    transaction_file = _resolve_transaction_file(args.data_path)
+    source_file = _resolve_transaction_file(args.data_path)
+    sample_path = _project_path(args.sample_path)
     output_dir = Path(_project_path(args.output_dir))
     spark = get_spark_session()
     model_results = None
     base_df = None
     try:
-        print(f"Using IBM AML transaction file: {transaction_file}")
+        print(f"Using original IBM AML transaction file: {source_file}")
+        transaction_file = create_stratified_sample(
+            spark,
+            source_file,
+            sample_path,
+            sample_size=args.sample_size,
+            seed=args.sample_seed,
+        )
         base_df = run_ibm_data_engineering(
             spark,
             transaction_file,

@@ -269,6 +269,8 @@ def _classification_metrics(
     )
     return {
         "accuracy": (true_positive + true_negative) / total if total else 0.0,
+        "true_positives": true_positive,
+        "true_negatives": true_negative,
         "precision": precision,
         "recall": recall,
         "f1": f1,
@@ -345,7 +347,7 @@ def _classifier_pipeline() -> list[tuple[str, object]]:
             DecisionTreeClassifier(
                 labelCol="label",
                 featuresCol="features",
-                maxDepth=5,
+                maxDepth=4,
                 weightCol="class_weight",
                 seed=42,
             ),
@@ -356,8 +358,9 @@ def _classifier_pipeline() -> list[tuple[str, object]]:
                 labelCol="label",
                 featuresCol="features",
                 weightCol="class_weight",
-                numTrees=20,
-                maxDepth=5,
+                numTrees=12,
+                maxDepth=4,
+                featureSubsetStrategy="sqrt",
                 seed=42,
             ),
         ),
@@ -395,6 +398,18 @@ def _write_supervised_artifacts(
         "threshold_selection": "maximum validation F1 over probability bins of width 0.001",
         "split_class_counts": {
             name: {str(label): count for label, count in counts.items()}
+            for name, counts in split_counts.items()
+        },
+        "splits": {
+            name: {
+                "rows": sum(counts.values()),
+                "positive_rows": counts.get(1.0, 0),
+                "positive_rate": (
+                    counts.get(1.0, 0) / sum(counts.values())
+                    if sum(counts.values())
+                    else 0.0
+                ),
+            }
             for name, counts in split_counts.items()
         },
         "models": rows,
@@ -481,14 +496,18 @@ def train_and_evaluate_models(
             ]
         )
         preprocessing_model = preprocessing.fit(train_data)
-        train_features = preprocessing_model.transform(train_data).persist(
-            StorageLevel.DISK_ONLY
+        train_features = (
+            preprocessing_model.transform(train_data)
+            .select("label", "class_weight", "raw_features", "features")
+            .persist(StorageLevel.DISK_ONLY)
         )
         validation_features = preprocessing_model.transform(
             splits["validation"]
-        ).persist(StorageLevel.DISK_ONLY)
-        test_features = preprocessing_model.transform(splits["test"]).persist(
-            StorageLevel.DISK_ONLY
+        ).select("label", "features").persist(StorageLevel.DISK_ONLY)
+        test_features = (
+            preprocessing_model.transform(splits["test"])
+            .select("transaction_id", "label", "features")
+            .persist(StorageLevel.DISK_ONLY)
         )
         try:
             train_features.count()
@@ -590,8 +609,9 @@ def train_and_evaluate_models(
 
     if metric_rows:
         schema = (
-            "model string, task string, accuracy double, precision double, recall double, "
-            "f1 double, false_positives long, false_negatives long, "
+            "model string, task string, accuracy double, true_positives long, "
+            "true_negatives long, precision double, recall double, f1 double, "
+            "false_positives long, false_negatives long, "
             "default_precision double, default_recall double, default_f1 double, "
             "default_false_positives long, default_false_negatives long, "
             "threshold double, area_under_pr double, area_under_roc double, "
@@ -605,6 +625,8 @@ def train_and_evaluate_models(
                         "model",
                         "task",
                         "accuracy",
+                        "true_positives",
+                        "true_negatives",
                         "precision",
                         "recall",
                         "f1",
