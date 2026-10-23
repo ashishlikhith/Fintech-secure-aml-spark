@@ -34,7 +34,7 @@
       "threshold": 0.921,
       "area_under_pr": 0.01946050036400931,
       "area_under_roc": 0.9448818383469627,
-      "training_seconds": 26.610465399999157
+      "training_seconds": 41.63167220000105
     },
     {
       "model": "Random Forest",
@@ -52,9 +52,9 @@
       "default_false_positives": 205833,
       "default_false_negatives": 26,
       "threshold": 0.884,
-      "area_under_pr": 0.02637030132370274,
-      "area_under_roc": 0.9558681686625078,
-      "training_seconds": 47.22483160000047
+      "area_under_pr": 0.02637033576249423,
+      "area_under_roc": 0.9558681686625079,
+      "training_seconds": 99.59101960000044
     },
     {
       "model": "Gradient-Boosted Trees",
@@ -74,7 +74,7 @@
       "threshold": 0.894,
       "area_under_pr": 0.026089582847561327,
       "area_under_roc": 0.9568394699990237,
-      "training_seconds": 110.23397209999894
+      "training_seconds": 136.97308329999942
     }
   ]
 }

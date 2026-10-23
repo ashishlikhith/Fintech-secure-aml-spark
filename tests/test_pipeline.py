@@ -6,15 +6,18 @@ from pathlib import Path
 
 from pyspark.sql import SparkSession
 
-from src.data_pipeline import run_data_engineering, run_ibm_data_engineering
-from src.feature_engineering import process_ml_features
-from src.model_pipeline import (
+from ml_models import (
     _classification_metrics,
+    process_ml_features,
     train_and_evaluate_models,
 )
-from src.sql_analytics import run_sql_analytics
-from src.visualization import create_pipeline_visualizations
-from run_pipeline import _resolve_transaction_file
+from spark_sql import run_sql_analytics
+from visualizations import create_pipeline_visualizations
+from main import (
+    _resolve_transaction_file,
+    run_data_engineering,
+    run_ibm_data_engineering,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -155,12 +158,14 @@ class SparkPipelineTests(unittest.TestCase):
                 _resolve_transaction_file(str(medium))
 
     def test_reusable_bounded_aml_sql_queries(self) -> None:
-        results = run_sql_analytics(self.spark)
+        results = run_sql_analytics(self.spark, transactions=self.base_df)
         self.assertEqual(results["transaction_totals"].count(), 1)
         self.assertLessEqual(results["highest_risk_transactions"].count(), 20)
         self.assertGreater(results["payment_type_summary"].count(), 0)
         self.assertGreater(results["near_threshold_summary"].count(), 0)
         self.assertGreater(results["sender_receiver_patterns"].count(), 0)
+        self.assertGreater(results["like_wildcard_example"].count(), 0)
+        self.assertLessEqual(results["dataframe_join_sql_example"].count(), 20)
         self.assertEqual(
             set(results),
             {
@@ -170,8 +175,12 @@ class SparkPipelineTests(unittest.TestCase):
                 "payment_type_summary",
                 "near_threshold_summary",
                 "sender_receiver_patterns",
+                "like_wildcard_example",
+                "dataframe_join_sql_example",
             },
         )
+        self.assertEqual(self.spark.table("rdd_transactions").count(), 48)
+        self.assertGreater(self.spark.table("rdd_sender_summary").count(), 0)
 
     def test_feature_pipeline_models_and_visualizations(self) -> None:
         with tempfile.TemporaryDirectory() as output_directory:

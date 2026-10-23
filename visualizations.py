@@ -1,3 +1,5 @@
+"""Create compact charts from Spark summaries and held-out predictions."""
+
 from pathlib import Path
 import math
 from typing import Mapping

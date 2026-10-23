@@ -1,8 +1,37 @@
 from pyspark.sql import DataFrame, SparkSession
 
 
+def _register_rdd_example_views(
+    spark: SparkSession, transactions: DataFrame
+) -> None:
+    """Convert a bounded DataFrame sample to an RDD, then back to a DataFrame."""
+    example_columns = [
+        "transaction_id",
+        "sender_account",
+        "receiver_account",
+        "amount",
+        "payment_type",
+        "is_laundering",
+    ]
+    small_dataframe = transactions.select(*example_columns).limit(100)
+
+    # This deliberately small conversion demonstrates the RDD-to-DataFrame API.
+    transaction_rdd = small_dataframe.rdd
+    rdd_dataframe = transaction_rdd.toDF(schema=small_dataframe.schema)
+    # RDD.toDF uses PySpark's active session; rebind this tiny example to the
+    # session whose SQL queries will read its temporary views.
+    rdd_dataframe = spark.createDataFrame(
+        rdd_dataframe.rdd, schema=small_dataframe.schema
+    )
+    rdd_dataframe.createOrReplaceTempView("rdd_transactions")
+
+    # DataFrame aggregation creates the second view used by the SQL join lesson.
+    sender_summary = rdd_dataframe.groupBy("sender_account").count()
+    sender_summary.createOrReplaceTempView("rdd_sender_summary")
+
+
 def build_sql_queries(near_threshold: float = 10000.0) -> dict[str, str]:
-    """Return bounded Spark SQL queries for transaction and risk analysis."""
+    """Return AML summaries plus short SQL examples for learning."""
     if near_threshold <= 0:
         raise ValueError("near_threshold must be greater than zero")
     lower_bound = near_threshold * 0.9
@@ -62,14 +91,40 @@ def build_sql_queries(near_threshold: float = 10000.0) -> dict[str, str]:
             ORDER BY transaction_count DESC, total_amount DESC
             LIMIT 20
         """,
+        "like_wildcard_example": """
+            SELECT transaction_id, payment_type, amount
+            FROM rdd_transactions
+            WHERE LOWER(payment_type) LIKE '%wire%'
+            ORDER BY amount DESC
+            LIMIT 20
+        """,
+        "dataframe_join_sql_example": """
+            SELECT summary.sender_account,
+                   summary.count AS sender_transaction_count,
+                   tx.payment_type,
+                   tx.is_laundering
+            FROM rdd_sender_summary AS summary
+            INNER JOIN rdd_transactions AS tx
+                ON summary.sender_account = tx.sender_account
+            WHERE LOWER(tx.payment_type) LIKE '%wire%'
+            ORDER BY summary.count DESC
+            LIMIT 20
+        """,
     }
 
 
 def run_sql_analytics(
     spark: SparkSession,
     near_threshold: float = 10000.0,
+    transactions: DataFrame | None = None,
 ) -> dict[str, DataFrame]:
-    """Execute the AML queries against the registered pipeline views."""
+    """Register temporary views and execute the AML and teaching queries."""
+    if transactions is None:
+        transactions = spark.table("transactions")
+    transactions.createOrReplaceTempView("transactions")
+    transactions.createOrReplaceTempView("aml_analysis")
+    _register_rdd_example_views(spark, transactions)
+
     return {
         name: spark.sql(query)
         for name, query in build_sql_queries(near_threshold).items()

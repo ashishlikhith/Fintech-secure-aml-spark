@@ -23,22 +23,23 @@ threshold.
 From the project root:
 
 ```powershell
-python run_pipeline.py
+python main.py
 ```
 
-This reads the entire `data\HI-Small_Trans.csv` file. The command deliberately
+This reads the smaller `data\HI-Small_Trans.csv` benchmark (about 476 MB),
+not the 3 GB HI-Medium file. The command deliberately
 accepts only a file named `HI-Small_Trans.csv`; it cannot select the medium or
 large benchmark. To specify another copy of the small CSV:
 
 ```powershell
-python run_pipeline.py --data-path "C:\data\HI-Small_Trans.csv" `
+python main.py --data-path "C:\data\HI-Small_Trans.csv" `
   --output-dir "artifacts\hi-small"
 ```
 
 Optional settings:
 
 ```powershell
-python run_pipeline.py --help
+python main.py --help
 ```
 
 ## Pipeline and outputs
@@ -96,6 +97,34 @@ error. Keep sufficient free disk space for Spark's local spill/cache files.
 The pipeline executes and saves bounded outputs for transaction totals,
 suspicious transactions by risk category, highest-risk transactions, payment
 type summaries, near-threshold sender patterns, and sender/receiver patterns.
+It also demonstrates beginner SQL concepts on at most 100 transaction rows:
+DataFrame-to-RDD-to-DataFrame conversion using `RDD.toDF()`, temporary views,
+`SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, aggregate functions, `INNER JOIN`,
+and `LIKE '%WIRE%'`. The example is deliberately bounded; the AML summaries
+run against the full HI-Small input. The entry point prints the DataFrame
+schema and five example rows without sorting or collecting the full dataset.
+
+## Python files
+
+- `main.py`: command-line entry point; runs the stages in order and
+  reads the Spark settings, validates transactions, builds account activity
+  and illustrative risk features, and writes the bounded SQL query results.
+- `ml_models.py`: selects model inputs, handles missing numeric values,
+  creates the Spark-computed correlation heatmap, makes chronological
+  train/validation/test splits, trains the three classifiers, and saves
+  evaluation metrics.
+- `spark_sql.py`: registers SQL views, creates the small RDD lesson,
+  and holds the AML and syllabus query examples.
+- `visualizations.py`: creates the transaction, model-comparison,
+  confusion-matrix, feature-importance, and transaction-flow plots.
+- `tests/test_pipeline.py`: exercises the pipeline with small generated data.
+
+The AML task is a classification problem, so the project reports a confusion
+matrix, precision, recall, F1, PR-AUC, and ROC-AUC. RMSE, MAE, and R-squared
+are regression metrics and are not applicable to these classifiers. Linear
+and logistic regression, K-means, SVM, and Naive Bayes are not mixed into the
+three-model AML comparison; they can be practised as separate syllabus
+exercises. K-means is not part of this project.
 
 ## Tests
 
