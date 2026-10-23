@@ -1,131 +1,147 @@
+"""
+spark_sql.py
+------------
+Contains 7 Spark SQL queries that demonstrate syllabus concepts:
+  1. SELECT + WHERE           – filter high-value transactions
+  2. GROUP BY + HAVING        – senders with many transactions
+  3. ORDER BY + DISTINCT      – distinct payment types ranked
+  4. COUNT, SUM, AVG, MIN, MAX – aggregate statistics
+  5. JOIN                     – join transactions with a sender summary
+  6. LIKE with % and _        – wildcard pattern matching
+  7. Combined query           – GROUP BY + ORDER BY + aggregates
+
+Each query uses actual columns from the IBM AML dataset.
+
+Viva summary:
+  - build_queries()      → returns a dict of {name: SQL string}
+  - run_sql_queries()    → registers temp views and executes all queries
+"""
+
 from pyspark.sql import DataFrame, SparkSession
 
 
-def _register_rdd_example_views(
-    spark: SparkSession, transactions: DataFrame
-) -> None:
-    """Convert a bounded DataFrame sample to an RDD, then back to a DataFrame."""
-    example_columns = [
-        "transaction_id",
-        "sender_account",
-        "receiver_account",
-        "amount",
-        "payment_type",
-        "is_laundering",
-    ]
-    small_dataframe = transactions.select(*example_columns).limit(100)
-
-    # This deliberately small conversion demonstrates the RDD-to-DataFrame API.
-    transaction_rdd = small_dataframe.rdd
-    rdd_dataframe = transaction_rdd.toDF(schema=small_dataframe.schema)
-    # RDD.toDF uses PySpark's active session; rebind this tiny example to the
-    # session whose SQL queries will read its temporary views.
-    rdd_dataframe = spark.createDataFrame(
-        rdd_dataframe.rdd, schema=small_dataframe.schema
-    )
-    rdd_dataframe.createOrReplaceTempView("rdd_transactions")
-
-    # DataFrame aggregation creates the second view used by the SQL join lesson.
-    sender_summary = rdd_dataframe.groupBy("sender_account").count()
-    sender_summary.createOrReplaceTempView("rdd_sender_summary")
-
-
-def build_sql_queries(near_threshold: float = 10000.0) -> dict[str, str]:
-    """Return AML summaries plus short SQL examples for learning."""
-    if near_threshold <= 0:
-        raise ValueError("near_threshold must be greater than zero")
-    lower_bound = near_threshold * 0.9
+def build_queries() -> dict[str, str]:
+    """
+    Return a dict of named SQL queries.
+    All queries run against the 'transactions' temp view which has columns:
+      transaction_id, timestamp, sender_account, receiver_account,
+      amount, payment_type, payment_currency, is_laundering,
+      velocity_24h, volume_24h, risk_score, risk_category, etc.
+    """
     return {
-        "transaction_totals": """
-            SELECT COUNT(*) AS transaction_count,
-                   SUM(amount) AS total_amount,
-                   AVG(amount) AS average_amount,
-                   MIN(amount) AS minimum_amount,
-                   MAX(amount) AS maximum_amount
+        # ------------------------------------------------------------------
+        # Q1: SELECT + WHERE – find transactions above $50,000
+        # Demonstrates: basic column selection and row filtering
+        # ------------------------------------------------------------------
+        "high_value_transactions": """
+            SELECT transaction_id, sender_account, receiver_account,
+                   amount, payment_type, is_laundering
             FROM transactions
-        """,
-        "suspicious_transactions_by_risk": """
-            SELECT risk_category,
-                   COUNT(*) AS transaction_count,
-                   AVG(risk_score) AS average_risk_score,
-                   SUM(amount) AS total_amount
-            FROM aml_analysis
-            GROUP BY risk_category
-            ORDER BY average_risk_score DESC
-        """,
-        "highest_risk_transactions": """
-            SELECT transaction_id, timestamp, sender_account, receiver_account,
-                   amount, risk_score, risk_category, risk_indicators
-            FROM aml_analysis
-            WHERE risk_score > 0
-            ORDER BY risk_score DESC, amount DESC
-            LIMIT 20
-        """,
-        "payment_type_summary": """
-            SELECT payment_type,
-                   COUNT(*) AS transaction_count,
-                   SUM(is_laundering) AS labeled_positive_count,
-                   AVG(is_laundering) AS labeled_positive_rate
-            FROM transactions
-            GROUP BY payment_type
-            ORDER BY transaction_count DESC
-            LIMIT 20
-        """,
-        "near_threshold_summary": f"""
-            SELECT sender_account,
-                   COUNT(*) AS transaction_count,
-                   SUM(amount) AS total_amount
-            FROM aml_analysis
-            WHERE amount >= {lower_bound} AND amount < {near_threshold}
-            GROUP BY sender_account
-            ORDER BY transaction_count DESC, total_amount DESC
-            LIMIT 20
-        """,
-        "sender_receiver_patterns": """
-            SELECT sender_account, receiver_account,
-                   COUNT(*) AS transaction_count,
-                   SUM(amount) AS total_amount,
-                   SUM(is_laundering) AS labeled_positive_count
-            FROM transactions
-            GROUP BY sender_account, receiver_account
-            ORDER BY transaction_count DESC, total_amount DESC
-            LIMIT 20
-        """,
-        "like_wildcard_example": """
-            SELECT transaction_id, payment_type, amount
-            FROM rdd_transactions
-            WHERE LOWER(payment_type) LIKE '%wire%'
+            WHERE amount > 50000
             ORDER BY amount DESC
             LIMIT 20
         """,
-        "dataframe_join_sql_example": """
-            SELECT summary.sender_account,
-                   summary.count AS sender_transaction_count,
-                   tx.payment_type,
-                   tx.is_laundering
-            FROM rdd_sender_summary AS summary
-            INNER JOIN rdd_transactions AS tx
-                ON summary.sender_account = tx.sender_account
-            WHERE LOWER(tx.payment_type) LIKE '%wire%'
-            ORDER BY summary.count DESC
+
+        # ------------------------------------------------------------------
+        # Q2: GROUP BY + HAVING – senders with 3+ transactions
+        # Demonstrates: grouping, aggregate filter (HAVING), COUNT
+        # ------------------------------------------------------------------
+        "active_senders": """
+            SELECT sender_account,
+                   COUNT(*)    AS tx_count,
+                   SUM(amount) AS total_sent
+            FROM transactions
+            GROUP BY sender_account
+            HAVING COUNT(*) >= 3
+            ORDER BY tx_count DESC
             LIMIT 20
+        """,
+
+        # ------------------------------------------------------------------
+        # Q3: ORDER BY + DISTINCT – list all unique payment types
+        # Demonstrates: DISTINCT keyword and alphabetical ordering
+        # ------------------------------------------------------------------
+        "distinct_payment_types": """
+            SELECT DISTINCT payment_type
+            FROM transactions
+            ORDER BY payment_type
+        """,
+
+        # ------------------------------------------------------------------
+        # Q4: COUNT, SUM, AVG, MIN, MAX – dataset-wide statistics
+        # Demonstrates: all five aggregate functions in one query
+        # ------------------------------------------------------------------
+        "transaction_statistics": """
+            SELECT COUNT(*)    AS total_transactions,
+                   SUM(amount) AS total_amount,
+                   AVG(amount) AS avg_amount,
+                   MIN(amount) AS min_amount,
+                   MAX(amount) AS max_amount
+            FROM transactions
+        """,
+
+        # ------------------------------------------------------------------
+        # Q5: JOIN – join transactions with per-sender summary
+        # Demonstrates: INNER JOIN on a derived table (subquery)
+        # ------------------------------------------------------------------
+        "join_sender_summary": """
+            SELECT t.transaction_id,
+                   t.sender_account,
+                   t.amount,
+                   s.tx_count,
+                   s.avg_amount AS sender_avg
+            FROM transactions t
+            INNER JOIN (
+                SELECT sender_account,
+                       COUNT(*)    AS tx_count,
+                       AVG(amount) AS avg_amount
+                FROM transactions
+                GROUP BY sender_account
+            ) s ON t.sender_account = s.sender_account
+            WHERE s.tx_count >= 3
+            ORDER BY s.tx_count DESC, t.amount DESC
+            LIMIT 20
+        """,
+
+        # ------------------------------------------------------------------
+        # Q6: LIKE with % and _ – wildcard pattern searches
+        # Demonstrates: % matches any characters, _ matches exactly one
+        # ------------------------------------------------------------------
+        "wildcard_search": """
+            SELECT transaction_id, payment_type, amount
+            FROM transactions
+            WHERE payment_type LIKE '%Wire%'
+               OR payment_type LIKE 'C___k'
+            ORDER BY amount DESC
+            LIMIT 20
+        """,
+
+        # ------------------------------------------------------------------
+        # Q7: Combined – AML flag rate by payment type
+        # Demonstrates: GROUP BY, aggregates, ORDER BY together
+        # ------------------------------------------------------------------
+        "aml_rate_by_payment_type": """
+            SELECT payment_type,
+                   COUNT(*)              AS total,
+                   SUM(is_laundering)    AS flagged,
+                   AVG(is_laundering)    AS flag_rate
+            FROM transactions
+            GROUP BY payment_type
+            ORDER BY flag_rate DESC
         """,
     }
 
 
-def run_sql_analytics(
-    spark: SparkSession,
-    near_threshold: float = 10000.0,
-    transactions: DataFrame | None = None,
-) -> dict[str, DataFrame]:
-    """Register temporary views and execute the AML and teaching queries."""
-    if transactions is None:
-        transactions = spark.table("transactions")
-    transactions.createOrReplaceTempView("transactions")
-    transactions.createOrReplaceTempView("aml_analysis")
-    _register_rdd_example_views(spark, transactions)
+def run_sql_queries(spark: SparkSession, df: DataFrame) -> dict[str, DataFrame]:
+    """
+    Register the enriched DataFrame as a temp view and execute all queries.
+    Returns a dict of {query_name: result_DataFrame}.
+    """
+    # Register so SQL can reference it as 'transactions'
+    df.createOrReplaceTempView("transactions")
 
-    return {
-        name: spark.sql(query)
-        for name, query in build_sql_queries(near_threshold).items()
-    }
+    results = {}
+    for name, sql in build_queries().items():
+        results[name] = spark.sql(sql)
+
+    return results
