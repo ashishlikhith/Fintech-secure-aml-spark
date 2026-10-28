@@ -284,6 +284,93 @@ The source CSV, generated sample, and artifacts may be excluded from version
 control by `.gitignore`; provide the source CSV at the documented path before
 running the application.
 
+## Jupyter notebook workflow
+
+The repository includes
+[`notebooks/01_aml_spark_workflow.ipynb`](notebooks/01_aml_spark_workflow.ipynb),
+a single end-to-end notebook for presentation and experimentation. It imports
+the existing Python modules rather than copying their data preparation,
+feature engineering, SQL, or model-training logic. Run cells from top to
+bottom from the repository root in one kernel.
+
+The notebook defaults to reusing the existing 500,000-row sample, running all
+three existing model fits and seven SQL queries, and displaying fresh scores,
+bounded prediction previews, SQL result tables, and charts inline as their
+cells execute. It does not load stale saved metrics or plots. Run cells from
+top to bottom. Model training can take several minutes. Sampling is the only
+expensive processing stage disabled by default because the prepared sample
+already exists.
+
+Notebook-run metrics are written by the existing training helper into a
+temporary directory that is removed after training. SQL tables and charts are
+displayed directly in notebook outputs and are not written to project artifact
+files. The notebook shows a small prediction preview per model rather than
+dumping every test prediction; the full test scores and confusion counts are
+calculated by the existing evaluation logic. Transaction previews are also
+bounded to keep driver memory and notebook output manageable.
+
+### Install and launch on Windows
+
+Use the same Python environment that has the project dependencies installed.
+From PowerShell, change to the repository root:
+
+```powershell
+Set-Location D:\Projects\Fintech-secure-aml-spark
+```
+
+If Jupyter is not already installed in that environment, install it there
+without changing the project's `requirements.txt`:
+
+```powershell
+python -m pip install notebook ipykernel
+```
+
+Register that Python environment as a notebook kernel (one-time per
+environment), then launch JupyterLab from the repository root:
+
+```powershell
+python -m ipykernel install --user --name fintech-aml-spark --display-name "Python (Fintech AML Spark)"
+python -m jupyter lab
+```
+
+Open `notebooks\01_aml_spark_workflow.ipynb` and select the **Python (Fintech
+AML Spark)** kernel. The selected kernel must be the same environment in which
+PySpark and the other project dependencies are installed. The notebook uses
+the same local Spark settings as `main.py` and does not change Python, Java,
+Spark, or PySpark versions.
+
+The notebook locates the project by searching the current working directory
+and its parents for `main.py`; launching Jupyter from the repository root
+ensures imports and data paths resolve as documented. If the prepared sample
+is missing, provide `data\HI-Small_Trans.csv` and set `RUN_SAMPLING = True` in
+the configuration cell. `RUN_MODEL_TRAINING` and `RUN_SQL_QUERIES` default to
+`True`, so their live outputs appear when those cells run. Set either to
+`False` to skip that stage. Training uses local CPU, memory, and temporary
+disk. Run the final notebook cell to release cached transactions and stop
+Spark after exploration.
+
+### Regenerate the project report
+
+From the repository root, run:
+
+```powershell
+python reports\generate_report.py
+```
+
+This regenerates the editable DOCX and PDF under `reports\` using only the
+notebook's code cells and embedded outputs. It does not execute the notebook;
+rerun the notebook first if the report should reflect new results.
+
+The first notebook cell adds the discovered project root to Python's import
+path before importing the project modules. If the notebook is opened from a
+location outside the project tree (for example, a copied notebook attachment),
+set `AML_SPARK_PROJECT_DIR` to the repository root before launching Jupyter:
+
+```powershell
+$env:AML_SPARK_PROJECT_DIR = "D:\Projects\Fintech-secure-aml-spark"
+python -m jupyter lab
+```
+
 ## Testing
 
 Run the generated-data tests from the repository root:
